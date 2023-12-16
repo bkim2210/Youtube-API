@@ -1,0 +1,295 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[35]:
+
+
+import sys
+#parse args to variables
+try:
+    script = sys.argv[0]
+    database = sys.argv[1]
+    server = sys.argv[2]
+    auditKey = sys.argv[3]
+    username = sys.argv[4]
+    password = sys.argv[5]
+    loadtype= sys.argv[6]
+    table = sys.argv[7]
+except Exception:
+    database = "Enter Database Name"
+    server = "Enter Server Name"
+    auditKey = "Enter Your Audit Key"
+    username = "Enter applicationID from Azure APP"
+    password = "Enter password from Azure APP"
+    loadtype="Enter Load type"
+
+
+#Import pyodbc to determine available drivers
+import pyodbc
+#find the best driver available
+driver_name = ''
+driver_names = [x for x in pyodbc.drivers() if x.endswith(' for SQL Server')]
+if driver_names:
+    driver_name = driver_names[0]
+else:
+    print('(No suitable driver found. Cannot connect.)')
+    
+#Import sql alchemy to enable connection
+import sqlalchemy as sa
+#Create a sql engine
+from sqlalchemy.engine import URL
+connection_string = "DRIVER={" + driver_name + "};SERVER=" + server + ";DATABASE=" + database + ";trusted_connection=yes"
+#connection_string = "DRIVER={SQL Server Native Client 11.0};Data Source=" + server + ";Initial Catalog=" + database + ";"
+connection_url = URL.create("mssql+pyodbc", query={"odbc_connect": connection_string})
+
+engine = sa.create_engine(connection_url)
+
+
+# ## 3. Create Functions
+
+# ### 3.1 Error Log Function
+# 
+
+# In[11]:
+
+
+#error log function needs predefined sql engine to log error to and error parameters
+def errorLog(engine, auditKey, e, detail=""):
+    import datetime
+    error_message = str(e).replace("'", "''") + detail
+    sql = f"""INSERT INTO log.Error 
+                (Audit_Key, [Error Code], [Error Description], [Date Time], [Package Name], [Source Name], [Source Description])
+              VALUES 
+                ('{auditKey}', 0, '{error_message}', '{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}', 'Execute External Job', 'Execute External Job', 'Execute External Job')
+            """
+    with engine.begin() as conn:
+        conn.execute(sa.text(sql))
+    raise e
+
+
+# ## 4. Import required libraries
+
+# In[16]:
+
+
+try:
+    import googleapiclient.discovery
+    from datetime import datetime, timedelta
+    from google.auth import compute_engine
+    from google.cloud import bigquery
+    from googleapiclient.discovery import build
+    from google.oauth2 import service_account
+    import pickle
+    import json, requests, pandas as pd
+    from azure.identity import ClientSecretCredential
+    from sqlalchemy import create_engine, text, MetaData
+    from datetime import datetime
+    import numpy as np
+    import urllib.parse
+    import os
+    import re
+    import time
+    import threading
+    import urllib.request
+except Exception as e:
+    errorLog(engine,auditKey,e)
+    raise e
+
+
+# In[26]:
+
+
+# Function to load the initial service account credentials
+from googleapiclient.discovery import build
+youtube = build('youtube','v3',developerKey= "Enter API Key")
+channelId = "Enter Channel ID"
+
+# getting all video details
+contentdata = youtube.channels().list(id=channelId,part='contentDetails').execute()
+playlist_id = contentdata['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+videos = [ ]
+next_page_token = None
+
+while 1:
+    res = youtube.playlistItems().list(playlistId=playlist_id,part='snippet',maxResults=50,pageToken=next_page_token).execute()
+    videos += res['items']
+    next_page_token = res.get('nextPageToken')
+    if next_page_token is None:
+        break
+
+# getting video id for each video
+video_ids = list(map(lambda x:x['snippet']['resourceId']['videoId'], videos))
+
+# Function to get video details
+def get_video_details(video_id, api_key):
+    youtube = build('youtube', 'v3', developerKey=api_key)
+    video_details = youtube.videos().list(
+        part='contentDetails,statistics,snippet',
+        id=video_id
+    ).execute()
+
+    if 'items' in video_details:
+        details = video_details['items'][0]
+        video_title = details['snippet']['title']
+        video_link = f'https://www.youtube.com/watch?v={video_id}'
+        publish_date = details['snippet']['publishedAt']
+
+        # Extract minutes and seconds from the duration string
+        video_duration = details['contentDetails'].get('duration', 'PT0S')
+        minutes = int(re.search(r'(\d+)M', video_duration).group(1)) if 'M' in video_duration else 0
+        seconds = int(re.search(r'(\d+)S', video_duration).group(1)) if 'S' in video_duration else 0
+        total_duration_seconds = minutes * 60 + seconds
+        is_short_video = total_duration_seconds <= 60
+
+        metrics = {
+            'video_id': video_id,
+            'video_title': video_title,
+            'video_link': video_link,
+            'publish_date': publish_date,
+            'is_short_video': is_short_video,
+            'view_count': details['statistics'].get('viewCount', 0),
+            'like_count': details['statistics'].get('likeCount', 0),
+            'dislike_count': details['statistics'].get('dislikeCount', 0),
+            'comment_count': details['statistics'].get('commentCount', 0)
+        }
+
+        return metrics
+
+# Fetch details for each video
+video_details_list = []
+for video_id in video_ids:
+    video_metrics = get_video_details(video_id, "Enter API Key")
+    video_details_list.append(video_metrics)
+
+# Display the details
+for video_details in video_details_list:
+    video_details
+
+video_df = pd.DataFrame(video_details_list)
+
+# Display the DataFrame
+SSCO=video_df
+SSCO['channel_id'] = 'Enter Channel ID'
+SSCO['channel_name'] = 'Enter Channel Name'
+SSCO
+    
+
+
+def get_video_ids_from_channel(channel_id, max_results=50):
+    youtube = build('youtube', 'v3', developerKey="Enter API Key"")
+    content_data = youtube.channels().list(id=channel_id, part='contentDetails,snippet').execute()
+    playlist_id = content_data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    channel_name = content_data['items'][0]['snippet']['title']
+    
+    videos = []
+    next_page_token = None
+
+    while True:
+        res = youtube.playlistItems().list(
+            playlistId=playlist_id,
+            part='snippet',
+            maxResults=max_results,
+            pageToken=next_page_token
+        ).execute()
+        
+        videos += res['items']
+        next_page_token = res.get('nextPageToken')
+
+        if not next_page_token:
+            break
+
+    video_info = [(video['snippet']['resourceId']['videoId'], channel_id, channel_name) for video in videos]
+    return video_info
+
+# List of channels
+channels = [
+    {"channel_id": "Enter Channel ID", "channel_name": "Enter Channel Name"},
+    {"channel_id": "Enter Channel ID-yYAVTKA", "channel_name": "Enter Channel Name"},
+    {"channel_id": "Enter Channel ID", "channel_name": "Enter Channel Name"},
+    {"channel_id": "Enter Channel ID", "channel_name": "Enter Channel Name"},
+    {"channel_id": "Enter Channel ID", "channel_name": "Enter Channel Name"},
+    {"channel_id": "Enter Channel ID", "channel_name": "Enter Channel Name"}
+]
+
+# Fetch video ids for each channel
+all_video_info = []
+for channel in channels:
+    video_info = get_video_ids_from_channel(channel["channel_id"])
+    all_video_info.extend(video_info)
+
+print("All Video Info:", all_video_info)
+Comp = pd.DataFrame(all_video_info, columns=['video_id', 'channel_id', 'channel_name'])
+
+# Rename the columns
+Comp = Comp.rename(columns={0: 'video_id', 1: 'channel_id', 2: 'channel_name'})
+
+# Display the updated DataFrame
+print(Comp)
+def get_video_details(video_id, api_key):
+    youtube = build('youtube', 'v3', developerKey=api_key)
+    video_details = youtube.videos().list(
+        part='contentDetails,statistics,snippet',
+        id=video_id
+    ).execute()
+
+    if 'items' in video_details:
+        details = video_details['items'][0]
+        video_title = details['snippet']['title']
+        video_link = f'https://www.youtube.com/watch?v={video_id}'
+        publish_date = details['snippet']['publishedAt']
+
+        # Extract minutes and seconds from the duration string
+        video_duration = details['contentDetails'].get('duration', 'PT0S')
+        minutes = int(re.search(r'(\d+)M', video_duration).group(1)) if 'M' in video_duration else 0
+        seconds = int(re.search(r'(\d+)S', video_duration).group(1)) if 'S' in video_duration else 0
+        total_duration_seconds = minutes * 60 + seconds
+        is_short_video = total_duration_seconds <= 60
+
+        metrics = {
+            'video_id': video_id,
+            'video_title': video_title,
+            'video_link': video_link,
+            'publish_date': publish_date,
+            'is_short_video': is_short_video,
+            'view_count': details['statistics'].get('viewCount', 0),
+            'like_count': details['statistics'].get('likeCount', 0),
+            'dislike_count': details['statistics'].get('dislikeCount', 0),
+            'comment_count': details['statistics'].get('commentCount', 0),
+            'channel_name': Comp[Comp['video_id'] == video_id]['channel_name'].iloc[0],
+            'channel_id': Comp[Comp['video_id'] == video_id]['channel_id'].iloc[0]
+        }
+
+        return metrics
+
+# List of video ids
+all_video_ids = Comp['video_id'].tolist()
+# Fetch details for each video
+video_details_list = []
+
+for video_id in all_video_ids:
+    video_metrics = get_video_details(video_id, "Enter API key")
+    video_details_list.append(video_metrics)
+
+# Create a DataFrame from the video details list
+Comp_Channels = pd.DataFrame(video_details_list)
+
+# Display the DataFrame
+print(Comp_Channels)
+# In[19]:
+df_merged = pd.concat([Comp_Channels, SSCO], ignore_index=True)
+new_order = ['video_id','video_link', 'video_title', 'channel_name', 'channel_id', 'publish_date',
+             'is_short_video', 'view_count', 'like_count', 'dislike_count',
+             'comment_count']
+df_reordered = df_merged.loc[:, new_order]
+df_reordered["pull_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+try:
+         df_reordered.to_sql(
+            name ="Youtube_Channels_Metrics", 
+            schema ="changeLog", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+        )
+except Exception as e:
+    errorLog(engine, e)
+    raise e
